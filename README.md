@@ -94,7 +94,7 @@ A comprehensive Windows desktop application for detecting and monitoring malicio
 
 2. **Clone and Build**:
    ```powershell
-   git clone <repository-url>
+   git clone https://github.com/KishanAmbaliyaa/KeyGuard
    cd KeyloggerDetector
    dotnet restore
    dotnet build KeyloggerDetector.csproj
