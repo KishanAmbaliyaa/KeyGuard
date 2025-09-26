@@ -1,0 +1,696 @@
+using System;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Dispatching;
+using KeyloggerDetector.Models;
+using KeyloggerDetector.Services;
+
+namespace KeyloggerDetector
+{
+    public sealed partial class MainWindow : Window
+    {
+        public ObservableCollection<ProcessNodeViewModel> ProcessNodes { get; set; }
+        public ObservableCollection<ProcessNodeViewModel> FilteredProcessNodes { get; set; }
+        public ObservableCollection<string> CaptureHistory { get; set; }
+        
+        private bool _isScanning = false;
+        private bool _isMonitoring = false;
+        private int _scanProgress = 0;
+        // No more process tab filtering - showing all processes together like Task Manager
+        
+        private DispatcherQueueTimer _progressTimer;
+        private DispatcherQueueTimer _processRefreshTimer;
+        
+        private readonly HierarchicalProcessScanner _hierarchicalScanner = new HierarchicalProcessScanner();
+        private readonly KeyboardHookService _keyboardHookService = new KeyboardHookService();
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            InitializeApp();
+            InitializeKeyboardHook();
+        }
+
+        private void InitializeApp()
+        {
+            ProcessNodes = new ObservableCollection<ProcessNodeViewModel>();
+            FilteredProcessNodes = new ObservableCollection<ProcessNodeViewModel>();
+            CaptureHistory = new ObservableCollection<string>();
+
+            // Bind to UI elements if they exist
+            try
+            {
+                if (ProcessDataGrid != null)
+                    ProcessDataGrid.ItemsSource = FilteredProcessNodes;
+                if (CaptureHistoryList != null)
+                    CaptureHistoryList.ItemsSource = CaptureHistory;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"UI binding error: {ex.Message}");
+            }
+
+            _progressTimer = new DispatcherTimer();
+            _progressTimer.Interval = TimeSpan.FromMilliseconds(100);
+            _progressTimer.Tick += (s, e) => UpdateScanProgress();
+
+            _processRefreshTimer = new DispatcherTimer();
+            _processRefreshTimer.Interval = TimeSpan.FromSeconds(3); // Refresh every 3 seconds like Task Manager
+            _processRefreshTimer.Tick += async (s, e) => await LoadProcessHierarchyAsync();
+
+            CaptureHistory.Add("🔐 KeyGuard Pro - Advanced Security Monitor Ready");
+            CaptureHistory.Add("📊 Task Manager-style Process Monitor Loaded");
+            CaptureHistory.Add("⌨️ Global Keyboard Monitoring Available");
+            
+            NavigateToProcesses(); // Start with Process Monitor instead of Scanner
+        }
+
+        private void InitializeKeyboardHook()
+        {
+            try
+            {
+                _keyboardHookService.KeyIntercepted += OnKeyIntercepted;
+                _keyboardHookService.HookStatusChanged += OnHookStatusChanged;
+                Debug.WriteLine("✅ Keyboard hook service initialized");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error initializing keyboard hook: {ex.Message}");
+            }
+        }
+
+        #region Global Keyboard Monitoring - THE MAIN FEATURE
+
+        private void OnKeyIntercepted(string processName, string windowTitle)
+        {
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                    var captureMessage = $"[{timestamp}] 🎯 INPUT DETECTED: {processName}.exe";
+                    
+                    if (!string.IsNullOrEmpty(windowTitle))
+                    {
+                        captureMessage += $" - {windowTitle}";
+                    }
+                    
+                    CaptureHistory.Add(captureMessage);
+                    
+                    // Keep only last 100 entries
+                    while (CaptureHistory.Count > 100)
+                    {
+                        CaptureHistory.RemoveAt(0);
+                    }
+                    
+                    // Scroll to bottom if possible
+                    try
+                    {
+                        if (CaptureHistoryList != null && CaptureHistoryList.Items.Count > 0)
+                        {
+                            CaptureHistoryList.ScrollIntoView(CaptureHistoryList.Items[CaptureHistoryList.Items.Count - 1]);
+                        }
+                    }
+                    catch { }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error handling key interception: {ex.Message}");
+            }
+        }
+
+        private void OnHookStatusChanged(bool isActive)
+        {
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                    var statusMessage = isActive 
+                        ? $"[{timestamp}] ✅ Global keyboard monitoring STARTED"
+                        : $"[{timestamp}] ❌ Global keyboard monitoring STOPPED";
+                    
+                    CaptureHistory.Add(statusMessage);
+                    
+                    // Update status if element exists
+                    try
+                    {
+                        if (MonitoringStatus != null)
+                        {
+                            MonitoringStatus.Text = isActive ? "Active" : "Stopped";
+                            MonitoringStatus.Foreground = isActive 
+                                ? new SolidColorBrush(Colors.LimeGreen) 
+                                : new SolidColorBrush(Colors.Red);
+                        }
+                    }
+                    catch { }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error handling hook status change: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region Process Hierarchy Management
+
+        private async Task LoadProcessHierarchyAsync()
+        {
+            try
+            {
+                var progress = new Progress<string>(message =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        Debug.WriteLine($"Progress: {message}");
+                    });
+                });
+
+                var processNodes = await _hierarchicalScanner.ScanProcessHierarchyAsync(progress);
+                
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    ProcessNodes.Clear();
+                    foreach (var node in processNodes)
+                    {
+                        ProcessNodes.Add(node);
+                    }
+                    
+                    // Update filtered view based on current tab
+                    UpdateFilteredProcessView();
+                    
+                    var totalProcesses = CountAllProcessNodes(processNodes);
+                    var totalVisibleProcesses = CountVisibleProcesses(processNodes);
+                    var suspiciousCount = CountSuspiciousProcessNodes(processNodes);
+                    
+                    Debug.WriteLine($"Process view updated: {totalProcesses} total processes, {totalVisibleProcesses} visible, {suspiciousCount} suspicious");
+                    
+                    CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 📊 Process list refreshed - {totalProcesses} processes found ({totalVisibleProcesses} visible)");
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"LoadProcessHierarchy error: {ex}");
+            }
+        }
+
+        private void UpdateFilteredProcessView()
+        {
+            try
+            {
+                FilteredProcessNodes.Clear();
+                
+                // Show ALL processes together like Task Manager - no category filtering
+                foreach (var node in ProcessNodes)
+                {
+                    // Add the main node (group or individual process)
+                    FilteredProcessNodes.Add(node);
+                    
+                    // If it's an expanded group, add its children
+                    if (node.IsExpanded && node.HasChildren)
+                    {
+                        foreach (var child in node.Children)
+                        {
+                            FilteredProcessNodes.Add(child);
+                        }
+                    }
+                }
+
+                // Update tab headers with counts
+                UpdateTabCounts();
+                
+                Debug.WriteLine($"📺 UI DISPLAY RESULTS:");
+                Debug.WriteLine($"   • ProcessNodes loaded: {ProcessNodes.Count}");
+                Debug.WriteLine($"   • FilteredProcessNodes shown: {FilteredProcessNodes.Count}");
+                Debug.WriteLine($"   • Expected ~284 total processes");
+                
+                if (FilteredProcessNodes.Count < 200)
+                {
+                    Debug.WriteLine($"⚠️  UI FILTERING ISSUE: Only showing {FilteredProcessNodes.Count} processes!");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"UpdateFilteredProcessView error: {ex.Message}");
+            }
+        }
+
+        private void UpdateTabCounts()
+        {
+            try
+            {
+                // Update the process count display
+                Dispatcher.Invoke(() =>
+                {
+                    if (ProcessCountText != null)
+                        ProcessCountText.Text = $"({ProcessNodes.Count} total)";
+                });
+                Debug.WriteLine($"Total processes loaded: {ProcessNodes.Count}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"UpdateTabCounts error: {ex.Message}");
+            }
+        }
+
+        private int CountAllProcessNodes(System.Collections.Generic.IEnumerable<ProcessNodeViewModel> nodes)
+        {
+            int count = 0;
+            foreach (var node in nodes)
+            {
+                count++;
+                count += CountAllProcessNodes(node.Children);
+            }
+            return count;
+        }
+
+        private int CountVisibleProcesses(System.Collections.Generic.IEnumerable<ProcessNodeViewModel> nodes)
+        {
+            // Count processes that aren't grouped (individual processes + group headers)
+            return nodes.Count();
+        }
+
+        private int CountSuspiciousProcessNodes(System.Collections.Generic.IEnumerable<ProcessNodeViewModel> nodes)
+        {
+            int count = 0;
+            foreach (var node in nodes)
+            {
+                if (node.ProcessDetails.IsSuspicious)
+                    count++;
+                count += CountSuspiciousProcessNodes(node.Children);
+            }
+            return count;
+        }
+
+        #endregion
+
+        #region Navigation
+
+        private void NavigateToScanner()
+        {
+            HideAllPages();
+            try
+            {
+                if (ScannerPage != null) ScannerPage.Visibility = Visibility.Visible;
+            }
+            catch { }
+            _processRefreshTimer?.Stop();
+        }
+
+        private void NavigateToProcesses()
+        {
+            HideAllPages();
+            try
+            {
+                if (ProcessMonitorPage != null)
+                {
+                    ProcessMonitorPage.Visibility = Visibility.Visible;
+                    _ = LoadProcessHierarchyAsync();
+                    _processRefreshTimer?.Start();
+                }
+            }
+            catch { }
+        }
+
+        private void NavigateToPlayground()
+        {
+            HideAllPages();
+            try
+            {
+                if (PlaygroundPage != null) PlaygroundPage.Visibility = Visibility.Visible;
+            }
+            catch { }
+            _processRefreshTimer?.Stop();
+        }
+
+        private void NavigateToHistory()
+        {
+            HideAllPages();
+            try
+            {
+                if (HistoryPage != null) HistoryPage.Visibility = Visibility.Visible;
+            }
+            catch { }
+            _processRefreshTimer?.Stop();
+        }
+
+        private void NavigateToSettings()
+        {
+            HideAllPages();
+            try
+            {
+                if (SettingsPage != null) SettingsPage.Visibility = Visibility.Visible;
+            }
+            catch { }
+            _processRefreshTimer?.Stop();
+        }
+
+        private void HideAllPages()
+        {
+            try
+            {
+                if (ScannerPage != null) ScannerPage.Visibility = Visibility.Collapsed;
+                if (ProcessMonitorPage != null) ProcessMonitorPage.Visibility = Visibility.Collapsed;
+                if (PlaygroundPage != null) PlaygroundPage.Visibility = Visibility.Collapsed;
+                if (HistoryPage != null) HistoryPage.Visibility = Visibility.Collapsed;
+                if (SettingsPage != null) SettingsPage.Visibility = Visibility.Collapsed;
+            }
+            catch { }
+        }
+
+        #endregion
+
+        #region Event Handlers
+
+        // Navigation Event Handlers
+        private void NavigateToScanner(object sender, RoutedEventArgs e) => NavigateToScanner();
+        private void NavigateToProcesses(object sender, RoutedEventArgs e) => NavigateToProcesses();
+        private void NavigateToPlayground(object sender, RoutedEventArgs e) => NavigateToPlayground();
+        private void NavigateToHistory(object sender, RoutedEventArgs e) => NavigateToHistory();
+        private void NavigateToSettings(object sender, RoutedEventArgs e) => NavigateToSettings();
+
+        // Window Control Event Handlers
+        private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            try { this.DragMove(); } catch { }
+        }
+
+        private void MinimizeButton_Click(object sender, RoutedEventArgs e)
+        {
+            this.WindowState = WindowState.Minimized;
+        }
+
+        private void CloseButton_Click(object sender, RoutedEventArgs e)
+        {
+            this.Close();
+        }
+
+        // Process Monitor Event Handlers
+        private void RefreshProcesses_Click(object sender, RoutedEventArgs e)
+        {
+            _ = LoadProcessHierarchyAsync();
+        }
+
+        private void ProcessSearchBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            var searchText = (sender as TextBox)?.Text?.ToLower();
+            if (string.IsNullOrEmpty(searchText) || searchText == "search processes...")
+                return;
+            _ = LoadProcessHierarchyAsync();
+        }
+
+        // No more separate tabs - all processes shown together like Task Manager
+
+        // Tab appearance methods removed - single unified view now
+
+        private void ProcessDataGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            try
+            {
+                bool hasSelection = ProcessDataGrid?.SelectedItem != null;
+                if (EndTaskButton != null)
+                    EndTaskButton.IsEnabled = hasSelection;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ProcessDataGrid_SelectionChanged error: {ex.Message}");
+            }
+        }
+
+        private void TerminateSelectedProcess_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (ProcessDataGrid?.SelectedItem is ProcessNodeViewModel nodeViewModel)
+                {
+                    TerminateProcessInternal(nodeViewModel);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TerminateSelectedProcess_Click error: {ex.Message}");
+            }
+        }
+
+        // Expand/Collapse functionality for service groups
+        private void ExpandCollapseGroup_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is Button button && button.CommandParameter is ProcessNodeViewModel groupNode)
+                {
+                    groupNode.IsExpanded = !groupNode.IsExpanded;
+                    UpdateProcessDisplayAfterGroupChange();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ExpandCollapseGroup_Click error: {ex.Message}");
+            }
+        }
+
+        private void UpdateProcessDisplayAfterGroupChange()
+        {
+            try
+            {
+                // Rebuild the filtered view to show/hide children based on group expansion
+                var currentItems = FilteredProcessNodes.ToList();
+                FilteredProcessNodes.Clear();
+
+                foreach (var item in currentItems)
+                {
+                    FilteredProcessNodes.Add(item);
+                    
+                    // Add children if group is expanded
+                    if (item.IsExpanded && item.HasChildren)
+                    {
+                        foreach (var child in item.Children)
+                        {
+                            FilteredProcessNodes.Add(child);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"UpdateProcessDisplayAfterGroupChange error: {ex.Message}");
+            }
+        }
+
+        private void TerminateProcess_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is Button button && button.CommandParameter is ProcessNodeViewModel nodeViewModel)
+                {
+                    TerminateProcessInternal(nodeViewModel);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TerminateProcess_Click error: {ex.Message}");
+            }
+        }
+
+        private void TerminateProcessInternal(ProcessNodeViewModel nodeViewModel)
+        {
+            try
+            {
+                var processInfo = nodeViewModel.ProcessDetails;
+                var result = MessageBox.Show(
+                    $"Terminate '{processInfo.Name}' (PID: {processInfo.Id})?\n\nThis action cannot be undone.",
+                    "Confirm Process Termination",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+
+                if (result == MessageBoxResult.Yes)
+                {
+                    try
+                    {
+                        var process = Process.GetProcessById(processInfo.Id);
+                        process.Kill();
+                        MessageBox.Show("Process terminated successfully.", "Success",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+                        _ = LoadProcessHierarchyAsync();
+                        CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] ⚔️ Process terminated: {processInfo.Name} (PID: {processInfo.Id})");
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"Failed to terminate process: {ex.Message}", "Error",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TerminateProcessInternal error: {ex.Message}");
+            }
+        }
+
+        // Scanner Event Handlers
+        private void ScanButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_isScanning)
+            {
+                _isScanning = false;
+                _progressTimer.Stop();
+                CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] ❌ Scan stopped");
+            }
+            else
+            {
+                _isScanning = true;
+                _scanProgress = 0;
+                _progressTimer.Start();
+                CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 🔍 Scan started");
+            }
+        }
+
+        private void UpdateScanProgress()
+        {
+            if (_scanProgress < 100)
+            {
+                _scanProgress += 2;
+            }
+            else
+            {
+                _isScanning = false;
+                _progressTimer.Stop();
+                CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] ✅ Scan completed - System appears clean");
+            }
+        }
+
+        // Global Keyboard Monitoring Event Handler - THE MAIN FEATURE
+        private void MonitoringToggle_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_isMonitoring)
+                {
+                    // Stop global monitoring
+                    _keyboardHookService.Stop();
+                    _isMonitoring = false;
+                    
+                    if (sender is Button button)
+                        button.Content = "Start Global Monitoring";
+                    
+                    CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 🛑 Global keyboard monitoring stopped");
+                }
+                else
+                {
+                    // Start global monitoring - THIS IS THE KEY FEATURE
+                    bool success = _keyboardHookService.Start();
+                    if (success)
+                    {
+                        _isMonitoring = true;
+                        
+                        if (sender is Button button)
+                            button.Content = "Stop Global Monitoring";
+                        
+                        CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 🚀 GLOBAL MONITORING STARTED!");
+                        CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 📡 Monitoring keystrokes across ALL applications");
+                        CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 🎯 Try typing in Chrome, Notepad, File Explorer...");
+                    }
+                    else
+                    {
+                        MessageBox.Show(
+                            "Failed to start global keyboard monitoring.\n\n" +
+                            "Please ensure:\n" +
+                            "• Application is running as Administrator\n" +
+                            "• No antivirus is blocking the hook\n" +
+                            "• System resources are available",
+                            "Global Monitoring Error",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error with global monitoring: {ex.Message}", "Error", 
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void PlaygroundTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            try
+            {
+                if (_isMonitoring && sender is TextBox textBox)
+                {
+                    var currentText = textBox.Text;
+                    if (!string.IsNullOrEmpty(currentText))
+                    {
+                        var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                        CaptureHistory.Add($"[{timestamp}] 📝 Local input detected: {currentText.Length} characters in playground");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Additional Event Handlers
+        private void SelectFolderButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var dialog = new System.Windows.Forms.FolderBrowserDialog();
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] 📁 Folder selected: {dialog.SelectedPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error selecting folder: {ex.Message}", "Error", 
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void CancelScanButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_isScanning)
+            {
+                _isScanning = false;
+                _progressTimer?.Stop();
+                CaptureHistory.Add($"[{DateTime.Now:HH:mm:ss}] ❌ Scan cancelled by user");
+            }
+        }
+
+        #endregion
+
+        #region Cleanup
+
+        protected override void OnClosed(EventArgs e)
+        {
+            try
+            {
+                // Ensure keyboard hook is properly disposed
+                _keyboardHookService?.Stop();
+                _keyboardHookService?.Dispose();
+                
+                // Stop timers
+                _progressTimer?.Stop();
+                _processRefreshTimer?.Stop();
+                
+                Debug.WriteLine("✅ Application cleanup completed");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error during cleanup: {ex.Message}");
+            }
+            
+            base.OnClosed(e);
+        }
+
+        #endregion
+    }
+}

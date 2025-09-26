@@ -1,0 +1,556 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Microsoft.Data.Sqlite;
+using KeyloggerDetector.Models;
+using Newtonsoft.Json;
+
+namespace KeyloggerDetector.Services
+{
+    public class DatabaseManager
+    {
+        private readonly string connectionString;
+        
+        public DatabaseManager()
+        {
+            var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), 
+                "KeyGuardPro", "KeyGuardPro.db");
+            
+            // Ensure directory exists
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath));
+            
+            connectionString = $"Data Source={dbPath}";
+            InitializeDatabase();
+        }
+        
+        private void InitializeDatabase()
+        {
+            using var connection = new SqliteConnection(connectionString);
+            connection.Open();
+            
+            var command = connection.CreateCommand();
+            command.CommandText = @"
+                CREATE TABLE IF NOT EXISTS ScanHistory (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Timestamp TEXT NOT NULL,
+                    ScanType TEXT NOT NULL,
+                    DirectoryPath TEXT NOT NULL,
+                    FilesScanned INTEGER NOT NULL,
+                    ThreatsFound INTEGER NOT NULL,
+                    ScanDuration INTEGER NOT NULL,
+                    Status TEXT NOT NULL,
+                    ResultsJson TEXT
+                );
+                
+                CREATE TABLE IF NOT EXISTS ScanResults (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ScanHistoryId INTEGER NOT NULL,
+                    FileName TEXT NOT NULL,
+                    FilePath TEXT NOT NULL,
+                    FileSize INTEGER NOT NULL,
+                    Status TEXT NOT NULL,
+                    DetectionCount INTEGER NOT NULL,
+                    TotalScans INTEGER NOT NULL,
+                    ThreatNames TEXT,
+                    MD5Hash TEXT,
+                    SHA1Hash TEXT,
+                    SHA256Hash TEXT,
+                    ScanDate TEXT NOT NULL,
+                    IsMalicious INTEGER DEFAULT 0,
+                    FOREIGN KEY (ScanHistoryId) REFERENCES ScanHistory (Id)
+                );
+                
+                CREATE TABLE IF NOT EXISTS ThreatHistory (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Timestamp TEXT NOT NULL,
+                    EventType TEXT NOT NULL,
+                    ProcessName TEXT,
+                    ProcessId INTEGER,
+                    WindowTitle TEXT,
+                    ThreatLevel TEXT,
+                    Severity TEXT NOT NULL,
+                    Status TEXT NOT NULL,
+                    Description TEXT,
+                    FilePath TEXT,
+                    FileSize INTEGER,
+                    Details TEXT,
+                    Action TEXT
+                );
+                
+                CREATE TABLE IF NOT EXISTS ThreatLog (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Timestamp TEXT NOT NULL,
+                    ProcessName TEXT NOT NULL,
+                    ProcessId INTEGER NOT NULL,
+                    ThreatLevel TEXT NOT NULL,
+                    Description TEXT,
+                    Action TEXT NOT NULL
+                );
+                
+                CREATE TABLE IF NOT EXISTS ActionLog (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Timestamp TEXT NOT NULL,
+                    Action TEXT NOT NULL,
+                    ProcessName TEXT,
+                    ProcessId INTEGER,
+                    Details TEXT
+                );
+                
+                CREATE TABLE IF NOT EXISTS AppSettings (
+                    Id INTEGER PRIMARY KEY,
+                    SettingsJson TEXT NOT NULL,
+                    UpdatedAt TEXT NOT NULL
+                );
+                
+                CREATE TABLE IF NOT EXISTS ProcessHistory (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ProcessName TEXT NOT NULL,
+                    ProcessId INTEGER NOT NULL,
+                    Path TEXT NOT NULL,
+                    StartTime TEXT NOT NULL,
+                    EndTime TEXT,
+                    HasKeyboardHooks INTEGER NOT NULL,
+                    ThreatLevel TEXT NOT NULL,
+                    CpuUsage REAL,
+                    MemoryUsage INTEGER,
+                    Timestamp TEXT NOT NULL
+                );";
+            
+            command.ExecuteNonQuery();
+        }
+
+        // Enhanced Scan History Methods
+        public int SaveScanHistory(string scanType, string directoryPath, int filesScanned, 
+            int threatsFound, TimeSpan duration, string status, List<ScanResult> results = null)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ScanHistory (Timestamp, ScanType, DirectoryPath, FilesScanned, ThreatsFound, ScanDuration, Status, ResultsJson)
+                    VALUES (@timestamp, @scanType, @directoryPath, @filesScanned, @threatsFound, @duration, @status, @resultsJson);
+                    SELECT last_insert_rowid();";
+                
+                command.Parameters.AddWithValue("@timestamp", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                command.Parameters.AddWithValue("@scanType", scanType);
+                command.Parameters.AddWithValue("@directoryPath", directoryPath);
+                command.Parameters.AddWithValue("@filesScanned", filesScanned);
+                command.Parameters.AddWithValue("@threatsFound", threatsFound);
+                command.Parameters.AddWithValue("@duration", (int)duration.TotalSeconds);
+                command.Parameters.AddWithValue("@status", status);
+                command.Parameters.AddWithValue("@resultsJson", results != null ? JsonConvert.SerializeObject(results) : (object)DBNull.Value);
+                
+                var scanId = Convert.ToInt32(command.ExecuteScalar());
+                
+                // Save individual scan results if provided
+                if (results != null)
+                {
+                    foreach (var result in results)
+                    {
+                        SaveScanResult(scanId, result);
+                    }
+                }
+                
+                return scanId;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error saving scan history: {ex.Message}");
+                return -1;
+            }
+        }
+
+        public void SaveScanResult(int scanHistoryId, ScanResult result)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ScanResults (ScanHistoryId, FileName, FilePath, FileSize, Status, DetectionCount, 
+                                           TotalScans, ThreatNames, MD5Hash, SHA1Hash, SHA256Hash, ScanDate, IsMalicious)
+                    VALUES (@scanHistoryId, @fileName, @filePath, @fileSize, @status, @detectionCount, 
+                            @totalScans, @threatNames, @md5Hash, @sha1Hash, @sha256Hash, @scanDate, @isMalicious)";
+                
+                command.Parameters.AddWithValue("@scanHistoryId", scanHistoryId);
+                command.Parameters.AddWithValue("@fileName", result.FileName);
+                command.Parameters.AddWithValue("@filePath", result.FilePath);
+                command.Parameters.AddWithValue("@fileSize", result.FileSize);
+                command.Parameters.AddWithValue("@status", result.Status);
+                command.Parameters.AddWithValue("@detectionCount", result.DetectionCount);
+                command.Parameters.AddWithValue("@totalScans", result.TotalScans);
+                command.Parameters.AddWithValue("@threatNames", result.ThreatNames != null ? JsonConvert.SerializeObject(result.ThreatNames) : (object)DBNull.Value);
+                command.Parameters.AddWithValue("@md5Hash", result.MD5Hash ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@sha1Hash", result.SHA1Hash ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@sha256Hash", result.SHA256Hash ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@scanDate", result.ScanDate.ToString("yyyy-MM-dd HH:mm:ss"));
+                command.Parameters.AddWithValue("@isMalicious", result.IsMalicious ? 1 : 0);
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error saving scan result: {ex.Message}");
+            }
+        }
+
+        public List<ScanResult> GetScanResults(int? scanHistoryId = null, DateTime? fromDate = null, DateTime? toDate = null)
+        {
+            var results = new List<ScanResult>();
+            
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                var whereClause = new List<string>();
+                
+                if (scanHistoryId.HasValue)
+                    whereClause.Add("ScanHistoryId = @scanHistoryId");
+                if (fromDate.HasValue)
+                    whereClause.Add("datetime(ScanDate) >= datetime(@fromDate)");
+                if (toDate.HasValue)
+                    whereClause.Add("datetime(ScanDate) <= datetime(@toDate)");
+                
+                command.CommandText = $@"
+                    SELECT * FROM ScanResults 
+                    {(whereClause.Any() ? "WHERE " + string.Join(" AND ", whereClause) : "")}
+                    ORDER BY ScanDate DESC";
+                
+                if (scanHistoryId.HasValue)
+                    command.Parameters.AddWithValue("@scanHistoryId", scanHistoryId.Value);
+                if (fromDate.HasValue)
+                    command.Parameters.AddWithValue("@fromDate", fromDate.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                if (toDate.HasValue)
+                    command.Parameters.AddWithValue("@toDate", toDate.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var scanResult = new ScanResult
+                    {
+                        FileName = reader.GetString("FileName"),
+                        FilePath = reader.GetString("FilePath"),
+                        FileSize = reader.GetInt64("FileSize"),
+                        Status = reader.GetString("Status"),
+                        DetectionCount = reader.GetInt32("DetectionCount"),
+                        TotalScans = reader.GetInt32("TotalScans"),
+                        MD5Hash = reader.IsDBNull(reader.GetOrdinal("MD5Hash")) ? null : reader.GetString("MD5Hash"),
+                        SHA1Hash = reader.IsDBNull(reader.GetOrdinal("SHA1Hash")) ? null : reader.GetString("SHA1Hash"),
+                        SHA256Hash = reader.IsDBNull(reader.GetOrdinal("SHA256Hash")) ? null : reader.GetString("SHA256Hash"),
+                        ScanDate = DateTime.Parse(reader.GetString("ScanDate")),
+                        IsMalicious = reader.GetInt32("IsMalicious") == 1
+                    };
+
+                    // Deserialize threat names
+                    if (!reader.IsDBNull(reader.GetOrdinal("ThreatNames")))
+                    {
+                        var threatNamesJson = reader.GetString("ThreatNames");
+                        scanResult.ThreatNames = JsonConvert.DeserializeObject<List<string>>(threatNamesJson) ?? new List<string>();
+                    }
+
+                    results.Add(scanResult);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error loading scan results: {ex.Message}");
+            }
+            
+            return results;
+        }
+
+        // Threat History Methods
+        public void SaveThreatHistoryEntry(ThreatHistoryEntry entry)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ThreatHistory (Timestamp, EventType, ProcessName, ProcessId, WindowTitle, 
+                                             ThreatLevel, Severity, Status, Description, FilePath, FileSize, Details, Action)
+                    VALUES (@timestamp, @eventType, @processName, @processId, @windowTitle, 
+                            @threatLevel, @severity, @status, @description, @filePath, @fileSize, @details, @action)";
+                
+                command.Parameters.AddWithValue("@timestamp", entry.Timestamp.ToString("yyyy-MM-dd HH:mm:ss"));
+                command.Parameters.AddWithValue("@eventType", entry.EventType.ToString());
+                command.Parameters.AddWithValue("@processName", entry.ProcessName ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@processId", entry.ProcessId ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@windowTitle", entry.WindowTitle ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@threatLevel", entry.ThreatLevel ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@severity", entry.Severity.ToString());
+                command.Parameters.AddWithValue("@status", entry.Status.ToString());
+                command.Parameters.AddWithValue("@description", entry.Description ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@filePath", entry.FilePath ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@fileSize", entry.FileSize ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@details", entry.Details ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@action", entry.Action ?? (object)DBNull.Value);
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error saving threat history: {ex.Message}");
+            }
+        }
+
+        public List<ThreatHistoryEntry> GetThreatHistory(DateTime? fromDate = null, DateTime? toDate = null, 
+            ThreatEventType? eventType = null, ThreatSeverity? severity = null, ThreatStatus? status = null)
+        {
+            var results = new List<ThreatHistoryEntry>();
+            
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                var whereClause = new List<string>();
+                
+                if (fromDate.HasValue)
+                    whereClause.Add("datetime(Timestamp) >= datetime(@fromDate)");
+                if (toDate.HasValue)
+                    whereClause.Add("datetime(Timestamp) <= datetime(@toDate)");
+                if (eventType.HasValue)
+                    whereClause.Add("EventType = @eventType");
+                if (severity.HasValue)
+                    whereClause.Add("Severity = @severity");
+                if (status.HasValue)
+                    whereClause.Add("Status = @status");
+                
+                command.CommandText = $@"
+                    SELECT * FROM ThreatHistory 
+                    {(whereClause.Any() ? "WHERE " + string.Join(" AND ", whereClause) : "")}
+                    ORDER BY Timestamp DESC";
+                
+                if (fromDate.HasValue)
+                    command.Parameters.AddWithValue("@fromDate", fromDate.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                if (toDate.HasValue)
+                    command.Parameters.AddWithValue("@toDate", toDate.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+                if (eventType.HasValue)
+                    command.Parameters.AddWithValue("@eventType", eventType.Value.ToString());
+                if (severity.HasValue)
+                    command.Parameters.AddWithValue("@severity", severity.Value.ToString());
+                if (status.HasValue)
+                    command.Parameters.AddWithValue("@status", status.Value.ToString());
+                
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var entry = new ThreatHistoryEntry
+                    {
+                        Timestamp = DateTime.Parse(reader.GetString("Timestamp")),
+                        EventType = Enum.Parse<ThreatEventType>(reader.GetString("EventType")),
+                        ProcessName = reader.IsDBNull(reader.GetOrdinal("ProcessName")) ? null : reader.GetString("ProcessName"),
+                        ProcessId = reader.IsDBNull(reader.GetOrdinal("ProcessId")) ? null : reader.GetInt32("ProcessId"),
+                        WindowTitle = reader.IsDBNull(reader.GetOrdinal("WindowTitle")) ? null : reader.GetString("WindowTitle"),
+                        ThreatLevel = reader.IsDBNull(reader.GetOrdinal("ThreatLevel")) ? null : reader.GetString("ThreatLevel"),
+                        Severity = Enum.Parse<ThreatSeverity>(reader.GetString("Severity")),
+                        Status = Enum.Parse<ThreatStatus>(reader.GetString("Status")),
+                        Description = reader.IsDBNull(reader.GetOrdinal("Description")) ? null : reader.GetString("Description"),
+                        FilePath = reader.IsDBNull(reader.GetOrdinal("FilePath")) ? null : reader.GetString("FilePath"),
+                        FileSize = reader.IsDBNull(reader.GetOrdinal("FileSize")) ? null : reader.GetInt64("FileSize"),
+                        Details = reader.IsDBNull(reader.GetOrdinal("Details")) ? null : reader.GetString("Details"),
+                        Action = reader.IsDBNull(reader.GetOrdinal("Action")) ? null : reader.GetString("Action")
+                    };
+                    
+                    results.Add(entry);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error loading threat history: {ex.Message}");
+            }
+            
+            return results;
+        }
+
+        // Settings Persistence Methods
+        public void SaveSettings(AppSettings settings)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT OR REPLACE INTO AppSettings (Id, SettingsJson, UpdatedAt)
+                    VALUES (1, @settingsJson, @updatedAt)";
+                
+                command.Parameters.AddWithValue("@settingsJson", JsonConvert.SerializeObject(settings, Formatting.Indented));
+                command.Parameters.AddWithValue("@updatedAt", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error saving settings: {ex.Message}");
+            }
+        }
+
+        public AppSettings LoadSettings()
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = "SELECT SettingsJson FROM AppSettings WHERE Id = 1";
+                
+                var result = command.ExecuteScalar();
+                if (result != null)
+                {
+                    var settingsJson = result.ToString();
+                    return JsonConvert.DeserializeObject<AppSettings>(settingsJson);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error loading settings: {ex.Message}");
+            }
+            
+            return new AppSettings(); // Return default settings if none found
+        }
+
+        // Process History Methods
+        public void SaveProcessSnapshot(ProcessInfo processInfo)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ProcessHistory (ProcessName, ProcessId, Path, StartTime, HasKeyboardHooks, 
+                                              ThreatLevel, CpuUsage, MemoryUsage, Timestamp)
+                    VALUES (@processName, @processId, @path, @startTime, @hasHooks, @threatLevel, @cpuUsage, @memoryUsage, @timestamp)";
+                
+                command.Parameters.AddWithValue("@processName", processInfo.Name);
+                command.Parameters.AddWithValue("@processId", processInfo.Id);
+                command.Parameters.AddWithValue("@path", processInfo.Path);
+                command.Parameters.AddWithValue("@startTime", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")); // Approximate
+                command.Parameters.AddWithValue("@hasHooks", processInfo.HasKeyboardHooks ? 1 : 0);
+                command.Parameters.AddWithValue("@threatLevel", processInfo.ThreatLevel);
+                command.Parameters.AddWithValue("@cpuUsage", processInfo.CpuUsage);
+                command.Parameters.AddWithValue("@memoryUsage", processInfo.MemoryUsage);
+                command.Parameters.AddWithValue("@timestamp", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error saving process snapshot: {ex.Message}");
+            }
+        }
+
+        // Original methods for backward compatibility
+        public void LogThreatDetection(ThreatInfo threat)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ThreatLog (Timestamp, ProcessName, ProcessId, ThreatLevel, Description, Action)
+                    VALUES (@timestamp, @processName, @processId, @threatLevel, @description, @action)";
+                
+                command.Parameters.AddWithValue("@timestamp", threat.DetectedAt.ToString("yyyy-MM-dd HH:mm:ss"));
+                command.Parameters.AddWithValue("@processName", threat.ProcessName);
+                command.Parameters.AddWithValue("@processId", threat.ProcessId);
+                command.Parameters.AddWithValue("@threatLevel", threat.ThreatLevel.ToString());
+                command.Parameters.AddWithValue("@description", threat.Description);
+                command.Parameters.AddWithValue("@action", "Detected");
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error: {ex.Message}");
+            }
+        }
+        
+        public void LogAction(string action, string processName = null, int? processId = null, string details = null)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = @"
+                    INSERT INTO ActionLog (Timestamp, Action, ProcessName, ProcessId, Details)
+                    VALUES (@timestamp, @action, @processName, @processId, @details)";
+                
+                command.Parameters.AddWithValue("@timestamp", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                command.Parameters.AddWithValue("@action", action);
+                command.Parameters.AddWithValue("@processName", processName ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@processId", processId ?? (object)DBNull.Value);
+                command.Parameters.AddWithValue("@details", details ?? (object)DBNull.Value);
+                
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database error: {ex.Message}");
+            }
+        }
+
+        // Cleanup and maintenance methods
+        public void CleanupOldRecords(int daysToKeep = 90)
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var cutoffDate = DateTime.Now.AddDays(-daysToKeep).ToString("yyyy-MM-dd HH:mm:ss");
+                
+                var tables = new[] { "ScanHistory", "ScanResults", "ThreatHistory", "ThreatLog", "ActionLog", "ProcessHistory" };
+                
+                foreach (var table in tables)
+                {
+                    var command = connection.CreateCommand();
+                    command.CommandText = $"DELETE FROM {table} WHERE datetime(Timestamp) < datetime(@cutoffDate)";
+                    command.Parameters.AddWithValue("@cutoffDate", cutoffDate);
+                    command.ExecuteNonQuery();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database cleanup error: {ex.Message}");
+            }
+        }
+
+        public void VacuumDatabase()
+        {
+            try
+            {
+                using var connection = new SqliteConnection(connectionString);
+                connection.Open();
+                
+                var command = connection.CreateCommand();
+                command.CommandText = "VACUUM";
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Database vacuum error: {ex.Message}");
+            }
+        }
+    }
+}
